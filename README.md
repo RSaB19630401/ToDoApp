@@ -17,6 +17,18 @@ geschützt durch Cloudflare Access.
 - Schnelleingabe versteht `heute`, `morgen`, `übermorgen` am Ende („Arzt anrufen morgen“)
 - Sync zwischen Geräten über D1; lokale Kopie für schnellen Start und Lesen offline
 
+## Phase 2 (Kalender, Erinnerungen, Wiederholungen)
+- Ansicht **Kalender**: Monatsraster mit Punkten (Farbe = Priorität), Tagesliste, geplante Wiederholungen
+- **Wiederholungen**: täglich, werktags, wöchentlich, monatlich, jährlich, benutzerdefiniert (alle X, Wochentage, Enddatum).
+  Beim Abhaken springt die Aufgabe auf den nächsten Termin, eine erledigte Kopie bleibt als Historie.
+- **Erinnerungen** per Web Push (Aufgaben mit Uhrzeit): zur Fälligkeit, 5/15/60 Min. oder 1 Tag vorher
+- **Morgen-Übersicht** (Standard 07:30, im Menü änderbar)
+- Push aktivieren: Menü ☰ → Benachrichtigungen. iPhone: nur in der installierten App (Home-Bildschirm).
+
+Technik: Der Worker `todoapp-reminder` (Ordner `reminder-worker/`, nutzt `lib/webpush.js`) läuft jede Minute per Cron
+und greift auf dieselbe D1-Datenbank zu. Er wird per Cloudflare-API deployt (nicht automatisch über GitHub).
+VAPID-Schlüssel liegen als Variable/Secret im Pages-Projekt und im Worker (`VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_JWK`, `VAPID_SUBJECT`).
+
 **Noch nicht in Phase 1:** Wiederholungen, Erinnerungen/Push, Kalender (Phase 2) – Habits, Pomodoro, KI (Phase 3).
 Offline kannst du lesen, Änderungen ohne Netz werden aber **nicht** gespeichert (Hinweis erscheint).
 

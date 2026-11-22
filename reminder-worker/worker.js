@@ -1,6 +1,6 @@
 /**
- * ToDoApp – Erinnerungs-Worker (Cloudflare Worker mit Cron "* * * * *")
- * Schickt jede Minute fällige Erinnerungen und einmal täglich die Morgen-Übersicht.
+ * ToDoApp – Erinnerungs-Worker (Cloudflare Worker mit Cron "*/5 * * * *")
+ * Schickt alle 5 Minuten fällige Erinnerungen und einmal täglich die Morgen-Übersicht.
  *
  * Bindings / Variablen:
  *   DB                 D1-Datenbank todoapp-db (dieselbe wie die App)

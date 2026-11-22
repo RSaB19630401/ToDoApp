@@ -25,7 +25,7 @@ geschützt durch Cloudflare Access.
 - **Morgen-Übersicht** (Standard 07:30, im Menü änderbar)
 - Push aktivieren: Menü ☰ → Benachrichtigungen. iPhone: nur in der installierten App (Home-Bildschirm).
 
-Technik: Der Worker `todoapp-reminder` (Ordner `reminder-worker/`, nutzt `lib/webpush.js`) läuft jede Minute per Cron
+Technik: Der Worker `todoapp-reminder` (Ordner `reminder-worker/`, nutzt `lib/webpush.js`) läuft alle 5 Minuten per Cron
 und greift auf dieselbe D1-Datenbank zu. Er wird per Cloudflare-API deployt (nicht automatisch über GitHub).
 VAPID-Schlüssel liegen als Variable/Secret im Pages-Projekt und im Worker (`VAPID_PUBLIC_KEY`, `VAPID_PRIVATE_JWK`, `VAPID_SUBJECT`).
 

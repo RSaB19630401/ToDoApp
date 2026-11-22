@@ -1,5 +1,5 @@
-/* ToDoApp Service Worker – Network-first für die App-Hülle, /api wird nie gecacht. */
-var CACHE = 'todoapp-shell-v1';
+/* ToDoApp Service Worker – Network-first für die App-Hülle, /api nie gecacht, Push-Benachrichtigungen. */
+var CACHE = 'todoapp-shell-v2';
 
 self.addEventListener('install', function () {
   self.skipWaiting();
@@ -33,6 +33,41 @@ self.addEventListener('fetch', function (e) {
         if (req.mode !== 'navigate') return Response.error();
         return caches.match('/').then(function (home) { return home || Response.error(); });
       });
+    })
+  );
+});
+
+/* ---------- Push ---------- */
+
+self.addEventListener('push', function (e) {
+  var data = {};
+  try { data = e.data ? e.data.json() : {}; } catch (err) { data = { title: 'ToDoApp', body: e.data ? e.data.text() : '' }; }
+  e.waitUntil(self.registration.showNotification(data.title || 'ToDoApp', {
+    body: data.body || '',
+    tag: data.tag || undefined,
+    renotify: !!data.tag,
+    icon: '/icon-192.png',
+    badge: '/icon-192.png',
+    lang: 'de',
+    data: { url: data.url || '/' }
+  }));
+});
+
+self.addEventListener('notificationclick', function (e) {
+  e.notification.close();
+  var target = (e.notification.data && e.notification.data.url) || '/';
+  var m = target.match(/[?&]task=([^&]+)/);
+  e.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(function (list) {
+      for (var i = 0; i < list.length; i++) {
+        var c = list[i];
+        if (new URL(c.url).origin === self.location.origin && 'focus' in c) {
+          if (m) c.postMessage({ type: 'open-task', id: decodeURIComponent(m[1]) });
+          else if (target.indexOf('view=today') >= 0) c.postMessage({ type: 'view-today' });
+          return c.focus();
+        }
+      }
+      return self.clients.openWindow(target);
     })
   );
 });

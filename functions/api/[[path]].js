@@ -8,20 +8,33 @@
  *   Variable  ACCESS_AUD          -> "Application Audience (AUD) Tag" der Access-App
  *   Variable  ALLOWED_EMAILS      -> optional, kommagetrennt, z. B. "ralf@example.de"
  *
+ * Für Push-Benachrichtigungen (Phase 2):
+ *   Variable  VAPID_PUBLIC_KEY    -> öffentlicher VAPID-Schlüssel (base64url)
+ *   Secret    VAPID_PRIVATE_JWK   -> privater VAPID-Schlüssel als JWK-JSON
+ *   Variable  VAPID_SUBJECT       -> z. B. "mailto:ralf@example.de"
+ *
  * Routen:
  *   GET    /api/bootstrap
  *   POST   /api/{tasks|lists|areas|categories}
  *   PATCH  /api/{tasks|lists|areas|categories}/{id}
  *   DELETE /api/{tasks|lists|areas|categories}/{id}
+ *   GET    /api/settings            PUT /api/settings
+ *   GET    /api/push/key
+ *   POST   /api/push/subscribe      POST /api/push/unsubscribe      POST /api/push/test
  */
+
+import { pushToOwner } from '../../lib/webpush.js';
 
 const FIELDS = {
   lists: ['name', 'color', 'sort'],
   areas: ['name', 'color', 'sort'],
   categories: ['name', 'color', 'sort'],
   tasks: ['parent_id', 'list_id', 'area_id', 'category_id', 'title', 'notes',
-    'urgency', 'importance', 'rated', 'due_date', 'due_time', 'recurrence', 'done', 'sort']
+    'urgency', 'importance', 'rated', 'due_date', 'due_time', 'recurrence', 'done', 'sort',
+    'remind_offset', 'remind_at']
 };
+
+const RECUR_FREQ = ['daily', 'weekly', 'monthly', 'yearly'];
 
 const DEFAULT_NAME = { lists: 'Eingang', areas: 'Allgemein', categories: 'Allgemein' };
 const REF_FIELD = { lists: 'list_id', areas: 'area_id', categories: 'category_id' };
@@ -68,7 +81,35 @@ const SCHEMA = [
     updated_at TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS idx_tasks_owner ON tasks(owner, done)`,
-  `CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id)`
+  `CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id)`,
+  `CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    endpoint TEXT NOT NULL UNIQUE,
+    p256dh TEXT NOT NULL,
+    auth TEXT NOT NULL,
+    user_agent TEXT,
+    created_at TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_push_owner ON push_subscriptions(owner)`,
+  `CREATE TABLE IF NOT EXISTS settings (
+    owner TEXT PRIMARY KEY,
+    tz TEXT NOT NULL DEFAULT 'Europe/Berlin',
+    morning_enabled INTEGER NOT NULL DEFAULT 1,
+    morning_time TEXT NOT NULL DEFAULT '07:30',
+    last_morning_date TEXT,
+    updated_at TEXT
+  )`
+];
+
+// Spalten, die nach Phase 1 dazugekommen sind (bestehende Tabellen werden ergänzt)
+const TASK_MIGRATIONS = {
+  remind_offset: 'ALTER TABLE tasks ADD COLUMN remind_offset INTEGER',
+  remind_at: 'ALTER TABLE tasks ADD COLUMN remind_at TEXT',
+  reminded: 'ALTER TABLE tasks ADD COLUMN reminded INTEGER NOT NULL DEFAULT 0'
+};
+const POST_MIGRATION = [
+  `CREATE INDEX IF NOT EXISTS idx_tasks_remind ON tasks(reminded, remind_at)`
 ];
 
 let schemaReady = false;
@@ -100,6 +141,14 @@ export async function onRequest(context) {
 
     if (resource === 'bootstrap' && method === 'GET' && !id) {
       return json(await bootstrap(env.DB, owner));
+    }
+    if (resource === 'settings' && !id) {
+      if (method === 'GET') return json(await getSettings(env.DB, owner));
+      if (method === 'PUT') return json(await putSettings(env.DB, owner, await readBody(request)));
+      throw new HttpError(405, 'Methode nicht erlaubt.');
+    }
+    if (resource === 'push' && id && extra === undefined) {
+      return json(await pushRoute(env, owner, id, method, request));
     }
     if (!FIELDS[resource] || extra !== undefined) throw new HttpError(404, 'Unbekannte Route.');
 
@@ -194,7 +243,89 @@ const b64urlText = s => new TextDecoder().decode(b64urlBytes(s));
 async function ensureSchema(db) {
   if (schemaReady) return;
   await db.batch(SCHEMA.map(sql => db.prepare(sql)));
+  const { results } = await db.prepare('PRAGMA table_info(tasks)').all();
+  const have = new Set(results.map(c => c.name));
+  for (const [col, sql] of Object.entries(TASK_MIGRATIONS)) {
+    if (have.has(col)) continue;
+    try { await db.prepare(sql).run(); } catch (e) {
+      if (!/duplicate column/i.test(String(e && e.message))) throw e; // parallele Migration
+    }
+  }
+  await db.batch(POST_MIGRATION.map(sql => db.prepare(sql)));
   schemaReady = true;
+}
+
+/* ---------- Einstellungen ---------- */
+
+const SETTINGS_DEFAULT = { tz: 'Europe/Berlin', morning_enabled: 1, morning_time: '07:30' };
+
+async function getSettings(db, owner) {
+  const row = await db.prepare('SELECT tz, morning_enabled, morning_time FROM settings WHERE owner = ?').bind(owner).first();
+  return { ...SETTINGS_DEFAULT, ...(row || {}) };
+}
+
+async function putSettings(db, owner, body) {
+  const cur = await getSettings(db, owner);
+  if ('tz' in body) {
+    const tz = String(body.tz || '').slice(0, 64);
+    try { new Intl.DateTimeFormat('de-DE', { timeZone: tz }); cur.tz = tz; }
+    catch (e) { throw new HttpError(400, 'Unbekannte Zeitzone.'); }
+  }
+  if ('morning_enabled' in body) cur.morning_enabled = body.morning_enabled ? 1 : 0;
+  if ('morning_time' in body) {
+    const t = String(body.morning_time || '');
+    if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(t)) throw new HttpError(400, 'Uhrzeit muss HH:MM sein.');
+    cur.morning_time = t;
+  }
+  await db.prepare(`INSERT INTO settings (owner, tz, morning_enabled, morning_time, updated_at) VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(owner) DO UPDATE SET tz = excluded.tz, morning_enabled = excluded.morning_enabled,
+    morning_time = excluded.morning_time, updated_at = excluded.updated_at`)
+    .bind(owner, cur.tz, cur.morning_enabled, cur.morning_time, nowIso()).run();
+  return cur;
+}
+
+/* ---------- Push ---------- */
+
+function vapidFromEnv(env) {
+  if (!env.VAPID_PUBLIC_KEY || !env.VAPID_PRIVATE_JWK) throw new HttpError(503, 'Push ist noch nicht eingerichtet (VAPID-Schlüssel fehlen).');
+  return { publicKey: env.VAPID_PUBLIC_KEY, privateJwk: env.VAPID_PRIVATE_JWK, subject: env.VAPID_SUBJECT || 'mailto:todoapp@example.com' };
+}
+
+async function pushRoute(env, owner, action, method, request) {
+  const db = env.DB;
+  if (action === 'key' && method === 'GET') {
+    const n = await db.prepare('SELECT COUNT(*) AS n FROM push_subscriptions WHERE owner = ?').bind(owner).first();
+    return { publicKey: env.VAPID_PUBLIC_KEY || null, devices: n ? n.n : 0 };
+  }
+  if (method !== 'POST') throw new HttpError(405, 'Methode nicht erlaubt.');
+
+  if (action === 'subscribe') {
+    const b = await readBody(request);
+    const endpoint = String(b.endpoint || '');
+    const keys = b.keys || {};
+    if (!/^https:\/\//.test(endpoint) || endpoint.length > 2000) throw new HttpError(400, 'Ungültiger Endpoint.');
+    if (!keys.p256dh || !keys.auth) throw new HttpError(400, 'Schlüssel fehlen.');
+    const ua = String(request.headers.get('User-Agent') || '').slice(0, 300);
+    await db.prepare(`INSERT INTO push_subscriptions (id, owner, endpoint, p256dh, auth, user_agent, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(endpoint) DO UPDATE SET owner = excluded.owner, p256dh = excluded.p256dh, auth = excluded.auth, user_agent = excluded.user_agent`)
+      .bind(crypto.randomUUID(), owner, endpoint, String(keys.p256dh).slice(0, 200), String(keys.auth).slice(0, 100), ua, nowIso()).run();
+    // Einstellungszeile anlegen, damit die Morgen-Übersicht greift
+    await db.prepare('INSERT OR IGNORE INTO settings (owner, updated_at) VALUES (?, ?)').bind(owner, nowIso()).run();
+    return { ok: true };
+  }
+  if (action === 'unsubscribe') {
+    const b = await readBody(request);
+    await db.prepare('DELETE FROM push_subscriptions WHERE owner = ? AND endpoint = ?').bind(owner, String(b.endpoint || '')).run();
+    return { ok: true };
+  }
+  if (action === 'test') {
+    const sent = await pushToOwner(db, owner, {
+      title: 'ToDoApp', body: 'Testbenachrichtigung – Push funktioniert. ✓', tag: 'test', url: '/'
+    }, vapidFromEnv(env));
+    if (!sent) throw new HttpError(502, 'Kein Gerät hat die Nachricht angenommen.');
+    return { ok: true, sent };
+  }
+  throw new HttpError(404, 'Unbekannte Route.');
 }
 
 async function defaultId(db, owner, table) {
@@ -218,7 +349,10 @@ async function bootstrap(db, owner) {
     db.prepare(`SELECT * FROM tasks WHERE owner = ? AND (done = 0 OR done_at >= ? OR parent_id IS NOT NULL)`).bind(owner, cutoff)
   ]);
   const strip = rows => rows.results.map(r => { const c = { ...r }; delete c.owner; return c; });
-  return { user: owner, lists: strip(lists), areas: strip(areas), categories: strip(categories), tasks: strip(tasks) };
+  return {
+    user: owner, lists: strip(lists), areas: strip(areas), categories: strip(categories), tasks: strip(tasks),
+    settings: await getSettings(db, owner)
+  };
 }
 
 async function readBody(request) {
@@ -245,8 +379,22 @@ function clean(resource, body) {
         v = String(v == null ? '' : v).slice(0, 20000);
         break;
       case 'color':
-      case 'recurrence':
         v = v ? String(v).slice(0, 200) : null;
+        break;
+      case 'recurrence':
+        v = v ? validRecurrence(v) : null;
+        break;
+      case 'remind_offset':
+        if (v === null || v === undefined || v === '') { v = null; break; }
+        v = parseInt(v, 10);
+        if (!(v >= 0 && v <= 10080)) throw new HttpError(400, 'Erinnerungsvorlauf ungültig.');
+        break;
+      case 'remind_at':
+        v = v ? String(v) : null;
+        if (v && (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?Z$/.test(v) || isNaN(Date.parse(v)))) {
+          throw new HttpError(400, 'Erinnerungszeit ungültig.');
+        }
+        if (v) v = new Date(v).toISOString();
         break;
       case 'urgency':
       case 'importance':
@@ -273,6 +421,25 @@ function clean(resource, body) {
     out[f] = v;
   }
   return out;
+}
+
+/** Wiederholung als JSON: { freq, interval, byweekday?: [0..6], until?: 'JJJJ-MM-TT' } */
+function validRecurrence(v) {
+  let r;
+  try { r = typeof v === 'string' ? JSON.parse(v) : v; } catch (e) { throw new HttpError(400, 'Wiederholung ungültig.'); }
+  if (!r || !RECUR_FREQ.includes(r.freq)) throw new HttpError(400, 'Wiederholung ungültig.');
+  const out = { freq: r.freq, interval: Math.min(999, Math.max(1, parseInt(r.interval, 10) || 1)) };
+  if (r.freq === 'weekly' && Array.isArray(r.byweekday) && r.byweekday.length) {
+    out.byweekday = [...new Set(r.byweekday.map(n => parseInt(n, 10)).filter(n => n >= 0 && n <= 6))].sort();
+  }
+  if ((r.freq === 'monthly' || r.freq === 'yearly') && r.dom) {
+    out.dom = Math.min(31, Math.max(1, parseInt(r.dom, 10) || 1));
+  }
+  if (r.until) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(r.until))) throw new HttpError(400, 'Enddatum ungültig.');
+    out.until = String(r.until);
+  }
+  return JSON.stringify(out);
 }
 
 /** Verweise auf Liste/Bereich/Kategorie prüfen; Unbekanntes fällt auf "Allgemein"/"Eingang" zurück. */
@@ -310,6 +477,7 @@ async function createRow(db, owner, resource, body) {
     await fixRefs(db, owner, data, id);
     data.updated_at = ts;
     if (data.done) data.done_at = ts;
+    data.reminded = 0;
   } else if (!data.name) {
     throw new HttpError(400, 'Name fehlt.');
   }
@@ -334,6 +502,7 @@ async function updateRow(db, owner, resource, id, body) {
     const ts = nowIso();
     data.updated_at = ts;
     if ('done' in data) data.done_at = data.done ? ts : null;
+    if ('remind_at' in data) data.reminded = 0; // neue Zeit -> erneut erinnern
   }
   const cols = Object.keys(data);
   const res = await db.prepare(`UPDATE ${resource} SET ${cols.map(c => c + ' = ?').join(', ')} WHERE id = ? AND owner = ?`)

@@ -1,4 +1,4 @@
-/* ToDoApp – Phase 1
+/* ToDoApp – Phase 2 (Kalender, Erinnerungen, Wiederholungen)
  * ES5, kein Build-Schritt. Daten liegen in Cloudflare D1 (über /api),
  * eine Kopie im localStorage sorgt für schnellen Start und Lesezugriff offline.
  */
@@ -8,6 +8,12 @@
   var LEVEL = { 1: 'Niedrig', 2: 'Mittel', 3: 'Hoch' };
   var SHORT = { 1: 'N', 2: 'M', 3: 'H' };
   var DAYS = ['So', 'Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa'];
+  var MONTHS = ['Januar', 'Februar', 'März', 'April', 'Mai', 'Juni', 'Juli', 'August', 'September', 'Oktober', 'November', 'Dezember'];
+  var REMIND = [
+    { v: '', name: 'Keine Erinnerung' }, { v: '0', name: 'Zur Fälligkeit' }, { v: '5', name: '5 Min. vorher' },
+    { v: '15', name: '15 Min. vorher' }, { v: '60', name: '1 Std. vorher' }, { v: '1440', name: '1 Tag vorher' }
+  ];
+  var UNIT = { daily: ['Tag', 'Tage'], weekly: ['Woche', 'Wochen'], monthly: ['Monat', 'Monate'], yearly: ['Jahr', 'Jahre'] };
   var CACHE_KEY = 'todoapp.data.v1';
   var UI_KEY = 'todoapp.ui.v1';
   var SMART = [
@@ -26,7 +32,9 @@
   var S = {
     user: '', lists: [], areas: [], categories: [], tasks: [],
     view: 'list', smart: 'all', listId: null, areaId: '', categoryId: '', search: '',
-    editId: null, showDone: false, drawer: false, loaded: false
+    editId: null, showDone: false, drawer: false, loaded: false,
+    settings: { tz: 'Europe/Berlin', morning_enabled: 1, morning_time: '07:30' },
+    calMonth: null, calDay: null, pushOn: false, pushDevices: 0
   };
 
   var chains = {};
@@ -34,6 +42,7 @@
   var lastLoad = 0;
   var toastTimer = null;
   var toastAction = null;
+  var pendingOpen = null;
 
   /* ---------- Hilfsfunktionen ---------- */
 
@@ -105,19 +114,123 @@
   function byDoneAt(a, b) { return (b.done_at || '') < (a.done_at || '') ? -1 : 1; }
   function bySort(a, b) { return (a.sort || 0) - (b.sort || 0); }
 
+  /* ---------- Wiederholungen ---------- */
+
+  function parseRec(t) {
+    if (!t || !t.recurrence) return null;
+    try {
+      var r = typeof t.recurrence === 'string' ? JSON.parse(t.recurrence) : t.recurrence;
+      return r && UNIT[r.freq] ? r : null;
+    } catch (e) { return null; }
+  }
+  function daysInMonth(y, m) { return new Date(y, m + 1, 0).getDate(); }
+  function weekIdx(s) { var p = s.split('-'); return Math.floor((Math.round(Date.UTC(+p[0], +p[1] - 1, +p[2]) / 864e5) + 3) / 7); }
+
+  // Nächster Termin nach dateStr (ein Schritt)
+  function stepRec(dateStr, r) {
+    var n = r.interval || 1, d = parseD(dateStr), y, m, day;
+    if (r.freq === 'daily') { d.setDate(d.getDate() + n); return dstr(d); }
+    if (r.freq === 'weekly') {
+      if (!r.byweekday || !r.byweekday.length) { d.setDate(d.getDate() + 7 * n); return dstr(d); }
+      var w0 = weekIdx(dateStr);
+      for (var i = 1; i <= 7 * n + 7; i++) {
+        var c = parseD(dateStr); c.setDate(c.getDate() + i);
+        var cs = dstr(c);
+        if (r.byweekday.indexOf(c.getDay()) >= 0 && (weekIdx(cs) - w0) % n === 0) return cs;
+      }
+      return null;
+    }
+    var months = r.freq === 'monthly' ? n : 12 * n;
+    y = d.getFullYear(); m = d.getMonth() + months;
+    y += Math.floor(m / 12); m = m % 12;
+    day = Math.min(r.dom || d.getDate(), daysInMonth(y, m));
+    return dstr(new Date(y, m, day));
+  }
+
+  // Nächster Termin für eine wiederkehrende Aufgabe (frühestens heute); null = Serie endet
+  function nextOccurrence(t) {
+    var r = parseRec(t);
+    if (!r || !t.due_date) return null;
+    var cur = t.due_date, t0 = todayStr();
+    for (var i = 0; i < 2000; i++) {
+      cur = stepRec(cur, r);
+      if (!cur || (r.until && cur > r.until)) return null;
+      if (cur >= t0) return cur;
+    }
+    return null;
+  }
+
+  // Zukünftige Termine einer Serie im Zeitraum (ohne den aktuellen Fälligkeitstermin)
+  function occurrencesBetween(t, from, to) {
+    var r = parseRec(t), out = [];
+    if (!r || !t.due_date || t.done) return out;
+    var cur = t.due_date;
+    for (var i = 0; i < 400; i++) {
+      cur = stepRec(cur, r);
+      if (!cur || cur > to || (r.until && cur > r.until)) break;
+      if (cur >= from) out.push(cur);
+    }
+    return out;
+  }
+
+  function recLabel(r) {
+    if (!r) return '';
+    var n = r.interval || 1, s;
+    if (r.freq === 'weekly' && n === 1 && r.byweekday && r.byweekday.join(',') === '1,2,3,4,5') s = 'Werktags';
+    else if (n === 1) s = { daily: 'Täglich', weekly: 'Wöchentlich', monthly: 'Monatlich', yearly: 'Jährlich' }[r.freq];
+    else s = 'Alle ' + n + ' ' + UNIT[r.freq][1];
+    if (r.freq === 'weekly' && r.byweekday && r.byweekday.length && s !== 'Werktags') {
+      s += ' (' + r.byweekday.slice().sort(function (a, b) { return ((a + 6) % 7) - ((b + 6) % 7); })
+        .map(function (x) { return DAYS[x]; }).join(', ') + ')';
+    }
+    if (r.until) { var u = parseD(r.until); s += ' bis ' + pad(u.getDate()) + '.' + pad(u.getMonth() + 1) + '.' + u.getFullYear(); }
+    return s;
+  }
+
+  function recPreset(r) {
+    if (!r) return '';
+    var n = r.interval || 1, wd = r.byweekday ? r.byweekday.join(',') : '';
+    if (r.until || n !== 1) return 'custom';
+    if (r.freq === 'weekly' && wd === '1,2,3,4,5') return 'workdays';
+    if (r.freq === 'weekly' && wd && r.byweekday.length > 1) return 'custom';
+    return r.freq;
+  }
+
+  /* ---------- Erinnerungen ---------- */
+
+  // Erinnerungszeitpunkt (UTC) aus Datum + Uhrzeit (Gerätezeitzone) minus Vorlauf; null wenn keiner/vergangen
+  function computeRemindAt(t) {
+    if (!t.due_date || !t.due_time || t.remind_offset === null || t.remind_offset === undefined || t.done) return null;
+    var p = t.due_date.split('-'), h = t.due_time.split(':');
+    var d = new Date(+p[0], +p[1] - 1, +p[2], +h[0], +h[1], 0, 0);
+    d = new Date(d.getTime() - t.remind_offset * 60000);
+    return d.getTime() > Date.now() ? d.toISOString() : null;
+  }
+
+  // Ergänzt einen Patch um remind_at, falls sich der Erinnerungszeitpunkt ändert
+  function withRemind(t, patch) {
+    var merged = extend(extend({}, t), patch);
+    var ra = computeRemindAt(merged);
+    if (ra !== (t.remind_at || null)) patch.remind_at = ra;
+    return patch;
+  }
+
   /* ---------- Speicher ---------- */
 
   function persist() {
     try {
       localStorage.setItem(CACHE_KEY, JSON.stringify({
-        user: S.user, lists: S.lists, areas: S.areas, categories: S.categories, tasks: S.tasks
+        user: S.user, lists: S.lists, areas: S.areas, categories: S.categories, tasks: S.tasks, settings: S.settings
       }));
     } catch (e) { /* Speicher voll oder gesperrt – egal, Server ist führend */ }
   }
   function loadCache() {
     try {
       var d = JSON.parse(localStorage.getItem(CACHE_KEY) || 'null');
-      if (d && d.tasks) { S.user = d.user || ''; S.lists = d.lists; S.areas = d.areas; S.categories = d.categories; S.tasks = d.tasks; }
+      if (d && d.tasks) {
+        S.user = d.user || ''; S.lists = d.lists; S.areas = d.areas; S.categories = d.categories; S.tasks = d.tasks;
+        if (d.settings) S.settings = d.settings;
+      }
     } catch (e) { /* ignorieren */ }
   }
   function saveUi() {
@@ -172,10 +285,14 @@
     lastLoad = Date.now();
     api('GET', 'bootstrap').then(function (d) {
       S.user = d.user; S.lists = d.lists; S.areas = d.areas; S.categories = d.categories; S.tasks = d.tasks;
+      if (d.settings) S.settings = d.settings;
       S.loaded = true;
       persist();
       render();
       if (S.editId) renderSheet();
+      syncTimezone();
+      if (pendingOpen && find(S.tasks, pendingOpen)) { openEditor(pendingOpen); }
+      pendingOpen = null;
     }).catch(function (e) {
       S.loaded = true;
       if (e && e.auth) { fail(e); return; }
@@ -192,7 +309,8 @@
       list_id: S.smart === 'list' && S.listId ? S.listId : idOf(defOf(S.lists)),
       area_id: S.areaId || idOf(defOf(S.areas)),
       category_id: S.categoryId || idOf(defOf(S.categories)),
-      due_date: S.smart === 'today' ? todayStr() : (S.smart === 'week' ? todayStr() : null)
+      due_date: S.view === 'calendar' ? (S.calDay || todayStr()) :
+        (S.smart === 'today' || S.smart === 'week' ? todayStr() : null)
     };
   }
 
@@ -202,6 +320,7 @@
       id: uuid(), parent_id: null, list_id: null, area_id: null, category_id: null,
       title: '', notes: '', urgency: 1, importance: 1, rated: 0,
       due_date: null, due_time: null, recurrence: null, done: 0, done_at: null,
+      remind_offset: null, remind_at: null,
       sort: Date.now(), created_at: now, updated_at: now
     };
     extend(t, newTaskDefaults());
@@ -225,6 +344,7 @@
   function updateTask(id, patch) {
     var t = find(S.tasks, id);
     if (!t) return;
+    if ('due_date' in patch || 'due_time' in patch || 'remind_offset' in patch || 'done' in patch) withRemind(t, patch);
     var changed = false;
     for (var k in patch) { if (t[k] !== patch[k]) changed = true; }
     if (!changed) return;
@@ -253,6 +373,7 @@
     var t = find(S.tasks, id);
     if (!t) return;
     var nd = t.done ? 0 : 1;
+    if (nd && !t.parent_id && parseRec(t)) { completeRecurring(t); return; }
     updateTask(id, { done: nd });
     render();
     if (S.editId) renderSheet();
@@ -262,6 +383,57 @@
         render();
         if (S.editId) renderSheet();
       }, 4000);
+    }
+  }
+
+  // Wiederkehrende Aufgabe abhaken: erledigte Kopie als Historie, Original springt auf den nächsten Termin
+  function completeRecurring(t) {
+    var next = nextOccurrence(t);
+    if (!next) { // Serie zu Ende -> normal erledigen
+      updateTask(t.id, { done: 1 });
+      render();
+      if (S.editId) renderSheet();
+      toast('„' + t.title + '“ erledigt – Serie beendet.', null, null, 4000);
+      return;
+    }
+    var oldDate = t.due_date;
+    var subs = childrenOf(t.id).filter(function (s) { return s.done; });
+    var hist = createTask({
+      title: t.title, notes: t.notes, list_id: t.list_id, area_id: t.area_id, category_id: t.category_id,
+      urgency: t.urgency, importance: t.importance, rated: t.rated,
+      due_date: t.due_date, due_time: t.due_time, done: 1, done_at: nowIso(), recurrence: null
+    });
+    updateTask(t.id, { due_date: next });
+    subs.forEach(function (s) { updateTask(s.id, { done: 0 }); });
+    render();
+    if (S.editId) renderSheet();
+    toast('Erledigt – nächster Termin: ' + fmtDue({ due_date: next }), 'Rückgängig', function () {
+      deleteTask(hist.id, false);
+      updateTask(t.id, { due_date: oldDate });
+      subs.forEach(function (s) { updateTask(s.id, { done: 1 }); });
+      render();
+      if (S.editId) renderSheet();
+    }, 5000);
+  }
+
+  function setRecurrence(t, r) {
+    var p = { recurrence: r ? JSON.stringify(r) : null };
+    if (r && !t.due_date) p.due_date = todayStr();
+    updateTask(t.id, p);
+    render();
+    renderSheet();
+  }
+
+  function presetRec(preset, t) {
+    var base = parseD(t.due_date || todayStr());
+    switch (preset) {
+      case 'daily': return { freq: 'daily', interval: 1 };
+      case 'workdays': return { freq: 'weekly', interval: 1, byweekday: [1, 2, 3, 4, 5] };
+      case 'weekly': return { freq: 'weekly', interval: 1, byweekday: [base.getDay()] };
+      case 'monthly': return { freq: 'monthly', interval: 1, dom: base.getDate() };
+      case 'yearly': return { freq: 'yearly', interval: 1, dom: base.getDate() };
+      case 'custom': return parseRec(t) || { freq: 'weekly', interval: 1, byweekday: [base.getDay()] };
+      default: return null;
     }
   }
 
@@ -316,7 +488,7 @@
 
   /* ---------- Filter ---------- */
 
-  function visibleTasks() {
+  function visibleTasks(ignoreSmart) {
     var q = S.search.trim().toLowerCase();
     var t0 = todayStr(), t7 = addDays(t0, 7);
     return S.tasks.filter(function (t) {
@@ -324,6 +496,7 @@
       if (S.areaId && t.area_id !== S.areaId) return false;
       if (S.categoryId && t.category_id !== S.categoryId) return false;
       if (q && (t.title + ' ' + (t.notes || '')).toLowerCase().indexOf(q) < 0) return false;
+      if (ignoreSmart) return S.smart === 'list' ? t.list_id === S.listId : true;
       switch (S.smart) {
         case 'list': return t.list_id === S.listId;
         case 'today': return !!t.due_date && t.due_date <= t0;
@@ -353,6 +526,7 @@
 
   function currentTitle() {
     if (S.smart === 'list') { var l = find(S.lists, S.listId); return l ? l.name : 'Liste'; }
+    if (S.view === 'calendar') return 'Kalender';
     for (var i = 0; i < SMART.length; i++) { if (SMART[i].id === S.smart) return SMART[i].name; }
     return 'Alle';
   }
@@ -391,7 +565,78 @@
   function renderMain() {
     var main = $('#main');
     if (!S.loaded && !S.tasks.length) { main.innerHTML = '<p class="empty">Lade …</p>'; return; }
-    main.innerHTML = S.view === 'matrix' ? matrixHtml() : listHtml();
+    main.innerHTML = S.view === 'matrix' ? matrixHtml() : (S.view === 'calendar' ? calendarHtml() : listHtml());
+  }
+
+  /* ---------- Kalender (Monat + Tagesliste) ---------- */
+
+  function calendarHtml() {
+    var t0 = todayStr();
+    if (!S.calDay) S.calDay = t0;
+    if (!S.calMonth) S.calMonth = S.calDay.slice(0, 7);
+    var y = +S.calMonth.slice(0, 4), m = +S.calMonth.slice(5, 7) - 1;
+    var first = new Date(y, m, 1);
+    var start = new Date(y, m, 1 - ((first.getDay() + 6) % 7)); // Montag vor/am Monatsersten
+    var weeks = Math.ceil((((first.getDay() + 6) % 7) + daysInMonth(y, m)) / 7);
+    var from = dstr(start), to = addDays(from, weeks * 7 - 1);
+
+    var byDay = {}, items = visibleTasks(true);
+    function add(day, t, virt) { (byDay[day] = byDay[day] || []).push({ t: t, virt: virt }); }
+    items.forEach(function (t) {
+      if (t.due_date && t.due_date >= from && t.due_date <= to) add(t.due_date, t, false);
+      occurrencesBetween(t, from, to).forEach(function (d) { add(d, t, true); });
+    });
+
+    var html = '<div class="cal"><div class="cal-head">' +
+      '<button class="icon-btn" data-act="calnav" data-v="-1" aria-label="Vorheriger Monat">‹</button>' +
+      '<strong>' + MONTHS[m] + ' ' + y + '</strong>' +
+      '<button class="icon-btn" data-act="calnav" data-v="1" aria-label="Nächster Monat">›</button>' +
+      '<button class="btn sm" data-act="caltoday">Heute</button></div><div class="cal-grid">';
+    ['Mo', 'Di', 'Mi', 'Do', 'Fr', 'Sa', 'So'].forEach(function (d) { html += '<div class="cal-wd">' + d + '</div>'; });
+    for (var i = 0; i < weeks * 7; i++) {
+      var ds = addDays(from, i), list = byDay[ds] || [];
+      var cls = 'cal-day' + (ds.slice(0, 7) !== S.calMonth ? ' other' : '') + (ds === t0 ? ' today' : '') + (ds === S.calDay ? ' sel' : '');
+      var dots = '';
+      list.slice(0, 4).forEach(function (e) {
+        dots += '<i class="dot s' + score(e.t) + (e.t.done ? ' done' : '') + (e.virt ? ' virt' : '') + '"></i>';
+      });
+      if (list.length > 4) dots += '<i class="more">+' + (list.length - 4) + '</i>';
+      html += '<button class="' + cls + '" data-act="calday" data-v="' + ds + '"><span class="n">' + (+ds.slice(8)) + '</span><span class="dots">' + dots + '</span></button>';
+    }
+    html += '</div></div>';
+
+    // Tagesliste
+    var sel = parseD(S.calDay);
+    var dayList = (byDay[S.calDay] || []).slice();
+    var open = dayList.filter(function (e) { return !e.t.done && !e.virt; }).map(function (e) { return e.t; }).sort(byPriority);
+    var virt = dayList.filter(function (e) { return e.virt; }).map(function (e) { return e.t; });
+    var done = dayList.filter(function (e) { return e.t.done && !e.virt; }).map(function (e) { return e.t; });
+    var label = DAYS[sel.getDay()] + ', ' + sel.getDate() + '. ' + MONTHS[sel.getMonth()];
+    if (S.calDay === t0) {
+      var over = items.filter(function (t) { return !t.done && t.due_date && t.due_date < t0; }).sort(byPriority);
+      html += section('Überfällig', over, 'overdue');
+    }
+    html += section(label, open);
+    if (virt.length) {
+      html += '<div class="group-title">Geplante Wiederholungen · ' + virt.length + '</div><div class="group">' +
+        virt.map(function (t) {
+          return '<div class="task virt s' + score(t) + '"><span class="chk ghost">↻</span><div class="tmain" data-act="open" data-id="' + esc(t.id) + '">' +
+            '<div class="ttitle">' + esc(t.title) + '</div><div class="tmeta"><span class="chip">↻ ' + esc(recLabel(parseRec(t))) + '</span>' +
+            (t.due_time ? '<span class="chip">' + esc(t.due_time) + '</span>' : '') + '</div></div></div>';
+        }).join('') + '</div>';
+    }
+    if (done.length) html += section('Erledigt', done);
+    if (!open.length && !virt.length && !done.length) html += '<p class="empty">Keine Aufgaben am ' + esc(label) + '.<br>Neue Aufgaben oben landen an diesem Tag.</p>';
+    return html;
+  }
+
+  function calNav(delta) {
+    var y = +S.calMonth.slice(0, 4), m = +S.calMonth.slice(5, 7) - 1 + delta;
+    var d = new Date(y, m, 1);
+    S.calMonth = d.getFullYear() + '-' + pad(d.getMonth() + 1);
+    var t0 = todayStr();
+    S.calDay = t0.slice(0, 7) === S.calMonth ? t0 : S.calMonth + '-01';
+    renderMain();
   }
 
   function unratedHint() {
@@ -415,6 +660,9 @@
       var sd = subs.filter(function (s) { return s.done; }).length;
       meta.push('<span class="chip">☑ ' + sd + '/' + subs.length + '</span>');
     }
+    var rec = parseRec(t);
+    if (rec && !t.done) meta.push('<span class="chip">↻ ' + esc(recLabel(rec)) + '</span>');
+    if (t.remind_at && !t.done) meta.push('<span class="chip" title="Erinnerung">🔔</span>');
     if (t.notes) meta.push('<span class="chip">✎</span>');
     if (!t.rated && !t.done) meta.push('<span class="chip new">unbewertet</span>');
     var id = esc(t.id);
@@ -520,6 +768,7 @@
     html += metaSection('categories', 'Kategorien (Filter)', function (x) {
       return { act: 'fcat', on: S.categoryId === x.id, cnt: openCount(function (t) { return t.category_id === x.id; }) };
     });
+    html += settingsHtml();
     html += '<div class="dr-foot">' + (S.user ? 'Angemeldet: ' + esc(S.user) + '<br>' : '') +
       '<button class="link" data-act="reload">Neu laden</button></div>';
     $('#drawer').innerHTML = html;
@@ -544,7 +793,109 @@
     S.drawer = open;
     $('#drawer').hidden = !open;
     $('#drawer-bg').hidden = !open;
-    if (open) renderDrawer();
+    if (open) { renderDrawer(); checkPush(); }
+  }
+
+  /* ---------- Einstellungen & Push ---------- */
+
+  function pushSupported() { return 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window; }
+  function isIos() { return /iphone|ipad|ipod/i.test(navigator.userAgent); }
+  function isStandalone() {
+    return window.navigator.standalone === true || (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+  }
+  function b64uToBytes(s) {
+    s = s.replace(/-/g, '+').replace(/_/g, '/');
+    while (s.length % 4) s += '=';
+    var bin = atob(s), out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  }
+
+  function settingsHtml() {
+    var st = S.settings, html = '<div class="dr-sec"><h3>Benachrichtigungen</h3><div class="set">';
+    if (!pushSupported()) {
+      html += '<p class="note">' + (isIos() && !isStandalone()
+        ? 'Auf dem iPhone funktionieren Benachrichtigungen nur in der installierten App: Teilen → „Zum Home-Bildschirm“, dann von dort öffnen.'
+        : 'Dieser Browser unterstützt keine Push-Benachrichtigungen.') + '</p>';
+    } else if (S.pushOn) {
+      html += '<p class="note">✓ Auf diesem Gerät aktiv' + (S.pushDevices > 1 ? ' (' + S.pushDevices + ' Geräte insgesamt)' : '') + '.</p>' +
+        '<div class="set-row"><button class="btn sm" data-act="pushtest">Test senden</button>' +
+        '<button class="btn sm" data-act="pushoff">Hier deaktivieren</button></div>';
+    } else {
+      html += '<p class="note">Erinnerungen und Morgen-Übersicht kommen als Push-Nachricht.</p>' +
+        '<button class="btn primary sm" data-act="pushon">Benachrichtigungen aktivieren</button>';
+    }
+    html += '<label class="set-check"><input type="checkbox" id="s-morning"' + (st.morning_enabled ? ' checked' : '') + '> Morgen-Übersicht um</label>' +
+      '<input type="time" id="s-mtime" value="' + esc(st.morning_time || '07:30') + '"' + (st.morning_enabled ? '' : ' disabled') + '>' +
+      '</div></div>';
+    return html;
+  }
+
+  function checkPush() {
+    if (!pushSupported()) return;
+    navigator.serviceWorker.ready.then(function (reg) { return reg.pushManager.getSubscription(); }).then(function (sub) {
+      var on = !!sub && Notification.permission === 'granted';
+      if (on !== S.pushOn) { S.pushOn = on; if (S.drawer) renderDrawer(); }
+      return api('GET', 'push/key');
+    }).then(function (k) {
+      if (k && k.devices !== S.pushDevices) { S.pushDevices = k.devices; if (S.drawer) renderDrawer(); }
+    }).catch(function () { /* still */ });
+  }
+
+  function enablePush() {
+    if (!pushSupported()) { toast('Push wird hier nicht unterstützt.'); return; }
+    var perm = Notification.requestPermission(); // muss direkt im Klick passieren
+    Promise.resolve(perm).then(function (p) {
+      if (p !== 'granted') throw new Error('Benachrichtigungen wurden nicht erlaubt. Bitte in den Geräte-Einstellungen freigeben.');
+      return api('GET', 'push/key');
+    }).then(function (k) {
+      if (!k.publicKey) throw new Error('Push ist auf dem Server noch nicht eingerichtet.');
+      return navigator.serviceWorker.ready.then(function (reg) {
+        return reg.pushManager.getSubscription().then(function (sub) {
+          return sub || reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uToBytes(k.publicKey) });
+        });
+      });
+    }).then(function (sub) {
+      return api('POST', 'push/subscribe', sub.toJSON());
+    }).then(function () {
+      S.pushOn = true;
+      if (S.drawer) renderDrawer();
+      checkPush();
+      toast('Benachrichtigungen aktiviert.', 'Test senden', sendTestPush, 6000);
+    }).catch(function (e) {
+      if (e && e.auth) fail(e); else toast((e && e.message) || 'Aktivieren fehlgeschlagen.', null, null, 7000);
+    });
+  }
+
+  function disablePush() {
+    navigator.serviceWorker.ready.then(function (reg) { return reg.pushManager.getSubscription(); }).then(function (sub) {
+      if (!sub) return null;
+      var ep = sub.endpoint;
+      return sub.unsubscribe().then(function () { return api('POST', 'push/unsubscribe', { endpoint: ep }); });
+    }).then(function () {
+      S.pushOn = false; if (S.drawer) renderDrawer(); toast('Benachrichtigungen auf diesem Gerät deaktiviert.');
+    }).catch(function (e) { toast((e && e.message) || 'Fehler', null, null, 5000); });
+  }
+
+  function sendTestPush() {
+    api('POST', 'push/test', {}).then(function (r) {
+      toast('Test gesendet (' + r.sent + ' Gerät' + (r.sent === 1 ? '' : 'e') + ').');
+    }).catch(function (e) { if (e && e.auth) fail(e); else toast(e.message, null, null, 6000); });
+  }
+
+  function saveSettings(patch) {
+    extend(S.settings, patch);
+    persist();
+    if (S.drawer) renderDrawer();
+    enqueue('settings', function () {
+      return api('PUT', 'settings', patch).then(function (s) { S.settings = s; persist(); });
+    });
+  }
+
+  function syncTimezone() {
+    var tz = '';
+    try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) { /* alt */ }
+    if (tz && S.settings.tz !== tz) saveSettings({ tz: tz });
   }
 
   /* ---------- Editor ---------- */
@@ -562,6 +913,7 @@
 
   function openEditor(id) {
     if (S.editId && S.editId !== id) blurActive();
+    if (S.editId !== id) S.recCustom = false;
     S.editId = id;
     renderSheet();
     $('#sheet').hidden = false;
@@ -602,6 +954,33 @@
     html += '<div class="grid2">' +
       field('Fällig am', '<input id="e-date" type="date" value="' + esc(t.due_date || '') + '">') +
       field('Uhrzeit', '<input id="e-time" type="time" value="' + esc(t.due_time || '') + '"' + (t.due_date ? '' : ' disabled') + '>');
+    var ro = t.remind_offset === null || t.remind_offset === undefined ? '' : String(t.remind_offset);
+    html += field('Erinnerung', '<select id="e-remind"' + (t.due_time ? '' : ' disabled') + '>' +
+      REMIND.map(function (o) { return '<option value="' + o.v + '"' + (o.v === ro ? ' selected' : '') + '>' + o.name + '</option>'; }).join('') +
+      '</select>' + (t.due_time ? '' : '<span class="hint-sm">Nur mit Uhrzeit</span>'));
+    if (!parent) {
+      var rec = parseRec(t), preset = S.recCustom ? 'custom' : recPreset(rec);
+      var opts = [['', 'Nie'], ['daily', 'Täglich'], ['workdays', 'Werktags (Mo–Fr)'], ['weekly', 'Wöchentlich'],
+        ['monthly', 'Monatlich'], ['yearly', 'Jährlich'], ['custom', 'Benutzerdefiniert …']];
+      html += field('Wiederholen', '<select id="e-rec">' + opts.map(function (o) {
+        return '<option value="' + o[0] + '"' + (o[0] === preset ? ' selected' : '') + '>' + o[1] + '</option>';
+      }).join('') + '</select>');
+      if (preset === 'custom' && rec) {
+        html += '<div class="full rec-box"><div class="rec-row"><span>Alle</span>' +
+          '<input id="e-rint" type="number" min="1" max="999" inputmode="numeric" value="' + (rec.interval || 1) + '">' +
+          '<select id="e-runit">' + ['daily', 'weekly', 'monthly', 'yearly'].map(function (f) {
+            return '<option value="' + f + '"' + (f === rec.freq ? ' selected' : '') + '>' + UNIT[f][(rec.interval || 1) === 1 ? 0 : 1] + '</option>';
+          }).join('') + '</select></div>';
+        if (rec.freq === 'weekly') {
+          html += '<div class="wd">' + [1, 2, 3, 4, 5, 6, 0].map(function (d) {
+            var on = rec.byweekday && rec.byweekday.indexOf(d) >= 0;
+            return '<button class="' + (on ? 'on' : '') + '" data-act="recday" data-v="' + d + '">' + DAYS[d] + '</button>';
+          }).join('') + '</div>';
+        }
+        html += '<label class="rec-row"><span>Endet am</span><input id="e-runtil" type="date" value="' + esc(rec.until || '') + '"></label>' +
+          '<p class="note">' + esc(recLabel(rec)) + (t.due_date ? ' · nächster Termin nach diesem: ' + esc(fmtDue({ due_date: stepRec(t.due_date, rec) || '' })) : '') + '</p></div>';
+      }
+    }
     if (!parent) {
       html += field('Liste', '<select id="e-list">' + optionsHtml(S.lists, null, t.list_id) + '</select>', true) +
         field('Bereich', '<select id="e-area">' + optionsHtml(S.areas, null, t.area_id) + '</select>') +
@@ -695,6 +1074,24 @@
       case 'markrated': updateTask(S.editId, { rated: 1 }); render(); renderSheet(); break;
       case 'mxadd': matrixAdd(parseInt(el.getAttribute('data-u'), 10), parseInt(el.getAttribute('data-i'), 10)); break;
       case 'showdone': S.showDone = !S.showDone; renderMain(); break;
+      case 'calnav': calNav(parseInt(v, 10)); break;
+      case 'caltoday': S.calDay = todayStr(); S.calMonth = S.calDay.slice(0, 7); renderMain(); break;
+      case 'calday':
+        S.calDay = v;
+        if (v.slice(0, 7) !== S.calMonth) S.calMonth = v.slice(0, 7);
+        renderMain();
+        break;
+      case 'recday':
+        var rt = find(S.tasks, S.editId), rr = parseRec(rt);
+        if (!rr) break;
+        var wdv = parseInt(v, 10), list = (rr.byweekday || []).slice(), pos = list.indexOf(wdv);
+        if (pos >= 0) { if (list.length > 1) list.splice(pos, 1); } else list.push(wdv);
+        rr.byweekday = list.sort();
+        setRecurrence(rt, rr);
+        break;
+      case 'pushon': enablePush(); break;
+      case 'pushoff': disablePush(); break;
+      case 'pushtest': sendTestPush(); break;
       case 'reload': location.reload(); break;
       case 'toast':
         $('#toast').hidden = true;
@@ -707,6 +1104,8 @@
     var id = e.target.id;
     if (id === 'f-area') { S.areaId = e.target.value; saveUi(); render(); return; }
     if (id === 'f-cat') { S.categoryId = e.target.value; saveUi(); render(); return; }
+    if (id === 's-morning') { saveSettings({ morning_enabled: e.target.checked ? 1 : 0 }); return; }
+    if (id === 's-mtime') { if (e.target.value) saveSettings({ morning_time: e.target.value }); return; }
     var t = S.editId ? find(S.tasks, S.editId) : null;
     if (!t) return;
     switch (id) {
@@ -719,11 +1118,46 @@
       case 'e-date':
         var d = e.target.value || null;
         var p = { due_date: d };
-        if (!d) p.due_time = null;
+        if (!d) { p.due_time = null; p.recurrence = null; }
+        var r0 = parseRec(t);
+        if (d && r0 && (r0.freq === 'monthly' || r0.freq === 'yearly')) { r0.dom = parseD(d).getDate(); p.recurrence = JSON.stringify(r0); }
         updateTask(t.id, p);
         renderSheet();
         break;
-      case 'e-time': updateTask(t.id, { due_time: e.target.value || null }); break;
+      case 'e-time':
+        var tm = e.target.value || null;
+        var pt = { due_time: tm };
+        if (tm && !t.due_time && (t.remind_offset === null || t.remind_offset === undefined)) pt.remind_offset = 0;
+        updateTask(t.id, pt);
+        renderSheet();
+        break;
+      case 'e-remind':
+        updateTask(t.id, { remind_offset: e.target.value === '' ? null : parseInt(e.target.value, 10) });
+        if (e.target.value !== '' && !S.pushOn && pushSupported()) {
+          toast('Tipp: Push im Menü (☰) unter „Benachrichtigungen“ aktivieren.', null, null, 5000);
+        }
+        renderSheet();
+        break;
+      case 'e-rec':
+        S.recCustom = e.target.value === 'custom';
+        setRecurrence(t, presetRec(e.target.value, t));
+        return;
+      case 'e-rint':
+      case 'e-runit':
+      case 'e-runtil':
+        var cr = parseRec(t);
+        if (!cr) return;
+        if (id === 'e-rint') cr.interval = Math.min(999, Math.max(1, parseInt(e.target.value, 10) || 1));
+        if (id === 'e-runtil') { if (e.target.value) cr.until = e.target.value; else delete cr.until; }
+        if (id === 'e-runit') {
+          cr.freq = e.target.value;
+          var bd = parseD(t.due_date || todayStr());
+          delete cr.byweekday; delete cr.dom;
+          if (cr.freq === 'weekly') cr.byweekday = [bd.getDay()];
+          if (cr.freq === 'monthly' || cr.freq === 'yearly') cr.dom = bd.getDate();
+        }
+        setRecurrence(t, cr);
+        return;
       case 'e-list': updateTask(t.id, { list_id: e.target.value }); break;
       case 'e-area': updateTask(t.id, { area_id: e.target.value }); break;
       case 'e-cat': updateTask(t.id, { category_id: e.target.value }); break;
@@ -777,9 +1211,25 @@
   loadUi();
   loadCache();
   S.editId = null;
+
+  // Direktlinks aus Benachrichtigungen: /?task=ID bzw. /?view=today
+  (function () {
+    var q = location.search;
+    var mt = q.match(/[?&]task=([^&]+)/), mv = q.match(/[?&]view=today/);
+    if (mt) pendingOpen = decodeURIComponent(mt[1]);
+    if (mv) { S.smart = 'today'; S.listId = null; S.view = 'list'; saveUi(); }
+    if ((mt || mv) && window.history && history.replaceState) history.replaceState(null, '', '/');
+  })();
+
   render();
+  if (pendingOpen && find(S.tasks, pendingOpen)) { openEditor(pendingOpen); pendingOpen = null; }
   load(true);
   if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js').catch(function () { /* optional */ });
+    navigator.serviceWorker.addEventListener('message', function (e) {
+      if (e.data && e.data.type === 'open-task' && find(S.tasks, e.data.id)) openEditor(e.data.id);
+      if (e.data && e.data.type === 'view-today') { S.smart = 'today'; S.view = 'list'; saveUi(); render(); }
+    });
   }
+  checkPush();
 })();
